@@ -279,7 +279,7 @@ def linkedin_login_and_search(email: str, password: str, config: SearchConfig) -
             f"&start={start}"
             f"&count={batch_sz}"
             "&sortBy=DD"
-            "&f_TPR=r2592000"   # last 30 days for more results
+            "&f_TPR=r3600"      # last 1 hour
             + (f"&f_E={exp_filter}" if exp_filter else "")
         )
         logger.info(f"LinkedIn: GET {api_url}")
