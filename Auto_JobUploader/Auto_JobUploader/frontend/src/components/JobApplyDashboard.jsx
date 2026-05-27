@@ -332,8 +332,9 @@ export default function App() {
   const [loading, setLoading]   = useState(false);
   const [toast, setToast]       = useState(null);
   const [filter, setFilter]     = useState("all");
-  const [mailJob, setMailJob]   = useState(null);   // job for Send Mail modal
-  const [mailTo,  setMailTo]    = useState("");
+  const [msgJob,     setMsgJob]     = useState(null);   // job for LinkedIn Message modal
+  const [msgLoading, setMsgLoading] = useState(false);
+  const [msgResult,  setMsgResult]  = useState(null);   // { messaged, failed, error }
   const [config, setConfig]     = useState({ role:"Python Developer", location:"India", experience:"0-3", max_jobs:50 });
   const [resume, setResume]     = useState(null);   // { name, size, file }
   const [resumeUploading, setResumeUploading] = useState(false);
@@ -532,6 +533,32 @@ export default function App() {
     fetchLog();
   };
 
+  // ── LinkedIn message ──
+  const handleSendMessage = async (job) => {
+    setMsgJob(job);
+    setMsgLoading(true);
+    setMsgResult(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/linkedin-message`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: user.email, password: user.password,
+          job_title: job.title, company: job.company, job_url: job.url,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setMsgResult({ success: true, messaged: data.messaged || [], failed: data.failed || [], total: data.total_found || 0 });
+      } else {
+        setMsgResult({ success: false, error: data.detail || "Failed to send messages." });
+      }
+    } catch {
+      setMsgResult({ success: false, error: "Cannot connect to backend." });
+    }
+    setMsgLoading(false);
+  };
+
   // ── Bulk apply ──
   const handleBulkApply = async () => {
     try {
@@ -650,36 +677,10 @@ export default function App() {
     localStorage.setItem("lastJobs", JSON.stringify(DEMO));
   };
 
-  // ── Location match (handles city aliases like Bangalore ↔ Bengaluru) ──
-  const locationMatches = (jobLocation, searchLocation) => {
-    if (!searchLocation || searchLocation.trim().toLowerCase() === "india") return true;
-    const job    = (jobLocation || "").toLowerCase();
-    const search = searchLocation.trim().toLowerCase();
-    if (job.includes(search)) return true;
-    const ALIASES = {
-      bangalore: ["bengaluru", "bangalore", "bangaluru"],
-      bengaluru: ["bengaluru", "bangalore", "bangaluru"],
-      bombay:    ["mumbai", "bombay"],
-      mumbai:    ["mumbai", "bombay"],
-      delhi:     ["delhi", "new delhi", "ncr", "noida", "gurgaon", "gurugram", "faridabad"],
-      ncr:       ["delhi", "new delhi", "ncr", "noida", "gurgaon", "gurugram", "faridabad"],
-      noida:     ["noida", "delhi", "ncr"],
-      gurgaon:   ["gurgaon", "gurugram", "delhi", "ncr"],
-      gurugram:  ["gurgaon", "gurugram", "delhi", "ncr"],
-      hyderabad: ["hyderabad", "secunderabad", "cyberabad"],
-      chennai:   ["chennai", "madras"],
-      kolkata:   ["kolkata", "calcutta"],
-    };
-    const variants = ALIASES[search] || [search];
-    return variants.some(v => job.includes(v));
-  };
-
-  // ── Filtered jobs (by status tab + location searched) ──
-  const displayedJobs = jobs.filter(j => {
-    const statusOk   = filter === "all" || j.status === filter;
-    const locationOk = locationMatches(j.location, config.location);
-    return statusOk && locationOk;
-  });
+  // ── Filtered jobs (by status tab only — backend already filters by location) ──
+  const displayedJobs = jobs.filter(j =>
+    filter === "all" || j.status === filter
+  );
 
   if (!user) return <LoginPage onLogin={(u) => { setUser(u); }} />;
 
@@ -913,8 +914,8 @@ export default function App() {
                           <button className="view-btn" onClick={() => handleGuidedApply(j)} disabled={j.status !== "pending"} style={{ marginRight:"4px" }} title="Step-by-step manual apply guide">
                             📋 Manual
                           </button>
-                          <button className="view-btn" onClick={() => { setMailJob(j); setMailTo(""); }} title="Send a job inquiry email to the company">
-                            📧 Mail
+                          <button className="view-btn" onClick={() => handleSendMessage(j)} title="Send LinkedIn message to people at this company">
+                            💬 Message
                           </button>
                         </td>
                       </tr>
@@ -996,8 +997,8 @@ export default function App() {
                           <button className="view-btn" onClick={() => handleGuidedApply(j)} disabled={j.status !== "pending"} style={{ marginRight:"4px" }} title="Step-by-step manual apply guide">
                             📋 Manual
                           </button>
-                          <button className="view-btn" onClick={() => { setMailJob(j); setMailTo(""); }} title="Send a job inquiry email to the company">
-                            📧 Mail
+                          <button className="view-btn" onClick={() => handleSendMessage(j)} title="Send LinkedIn message to people at this company">
+                            💬 Message
                           </button>
                         </td>
                       </tr>
@@ -1047,51 +1048,72 @@ export default function App() {
         </main>
       </div>
 
-      {/* Send Mail Modal */}
-      {mailJob && (() => {
-        const senderName  = (user?.email || "").split("@")[0];
-        const subject     = `Application for ${mailJob.title} position at ${mailJob.company}`;
-        const body        = `Dear Hiring Team at ${mailJob.company},\n\nI hope this message finds you well. I am writing to express my strong interest in the ${mailJob.title} position at ${mailJob.company}.\n\nI came across this opportunity and am confident that my background and skills are a great match for this role. I would welcome the chance to discuss how I can contribute to your team.\n\nPlease feel free to reach me at: ${user?.email}\n\nLooking forward to hearing from you!\n\nBest regards,\n${senderName}`;
-        const gmailUrl    = `https://mail.google.com/mail/?view=cm&fs=1&to=${encodeURIComponent(mailTo)}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-        const mailtoUrl   = `mailto:${encodeURIComponent(mailTo)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+      {/* LinkedIn Message Modal */}
+      {msgJob && (() => {
+        const senderName = (user?.email || "").split("@")[0].replace(".", " ");
+        const preview = `Hi [Name], I came across the ${msgJob.title} position at ${msgJob.company} and I'm genuinely excited about this opportunity.\n\nWith my background and passion for this field, I believe I could be a strong fit for the team. I'd love to connect briefly to learn more about the role and share how I could contribute.\n\nWould you be open to a quick chat? Thank you so much for your time!\n\nBest regards,\n${senderName}`;
         return (
-          <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.7)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:999 }}>
+          <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:999 }}>
             <div style={{ background:"var(--surface)", border:"1px solid var(--border)", borderRadius:"16px", padding:"28px", maxWidth:"520px", width:"90%", color:"var(--text)" }}>
-              <div style={{ fontSize:"18px", fontWeight:"700", marginBottom:"18px" }}>📧 Send Mail to {mailJob.company}</div>
+              <div style={{ fontSize:"18px", fontWeight:"700", marginBottom:"6px" }}>💬 LinkedIn Message</div>
+              <div style={{ fontSize:"13px", color:"var(--muted)", marginBottom:"18px" }}>{msgJob.title} @ {msgJob.company}</div>
 
-              <div style={{ marginBottom:"12px" }}>
-                <label style={{ fontSize:"12px", color:"var(--muted)", display:"block", marginBottom:"4px" }}>To (company HR / recruiter email)</label>
-                <input
-                  type="email" placeholder="hr@company.com"
-                  value={mailTo} onChange={e => setMailTo(e.target.value)}
-                  style={{ width:"100%", padding:"8px 10px", borderRadius:"8px", border:"1px solid var(--border)", background:"var(--bg)", color:"var(--text)", fontSize:"13px", boxSizing:"border-box" }}
-                />
-              </div>
+              {/* Loading */}
+              {msgLoading && (
+                <div style={{ textAlign:"center", padding:"24px 0" }}>
+                  <span className="spinner" style={{ display:"inline-block", width:"28px", height:"28px", border:"3px solid var(--border)", borderTopColor:"var(--accent)", borderRadius:"50%", animation:"spin 0.8s linear infinite", marginBottom:"12px" }} />
+                  <div style={{ fontSize:"14px", color:"var(--muted)" }}>Finding people at {msgJob.company} and sending messages...</div>
+                </div>
+              )}
 
-              <div style={{ marginBottom:"14px" }}>
-                <label style={{ fontSize:"12px", color:"var(--muted)", display:"block", marginBottom:"4px" }}>Subject</label>
-                <div style={{ fontSize:"13px", padding:"8px 10px", borderRadius:"8px", border:"1px solid var(--border)", background:"var(--bg)", color:"var(--text)" }}>{subject}</div>
-              </div>
+              {/* Success */}
+              {!msgLoading && msgResult?.success && (
+                <div>
+                  <div style={{ background:"rgba(34,197,94,0.1)", border:"1px solid #22c55e", borderRadius:"10px", padding:"14px", marginBottom:"14px" }}>
+                    <div style={{ fontWeight:"700", color:"#22c55e", marginBottom:"6px" }}>✅ Messages sent successfully!</div>
+                    {msgResult.messaged.length > 0 && (
+                      <div style={{ fontSize:"13px" }}>
+                        <span style={{ color:"var(--muted)" }}>Messaged: </span>
+                        {msgResult.messaged.join(", ")}
+                      </div>
+                    )}
+                    {msgResult.failed.length > 0 && (
+                      <div style={{ fontSize:"12px", color:"var(--yellow)", marginTop:"6px" }}>
+                        Could not message: {msgResult.failed.join(", ")}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
 
-              <div style={{ marginBottom:"18px" }}>
-                <label style={{ fontSize:"12px", color:"var(--muted)", display:"block", marginBottom:"4px" }}>Message preview</label>
-                <textarea readOnly value={body} rows={8}
-                  style={{ width:"100%", padding:"8px 10px", borderRadius:"8px", border:"1px solid var(--border)", background:"var(--bg)", color:"var(--muted)", fontSize:"12px", lineHeight:"1.6", resize:"none", boxSizing:"border-box" }}
-                />
-              </div>
+              {/* Error */}
+              {!msgLoading && msgResult && !msgResult.success && (
+                <div style={{ background:"rgba(239,68,68,0.1)", border:"1px solid var(--red)", borderRadius:"10px", padding:"14px", marginBottom:"14px" }}>
+                  <div style={{ fontWeight:"700", color:"var(--red)", marginBottom:"4px" }}>❌ Could not send message</div>
+                  <div style={{ fontSize:"13px", color:"var(--muted)" }}>{msgResult.error}</div>
+                </div>
+              )}
 
-              <div style={{ display:"flex", gap:"8px", flexWrap:"wrap" }}>
-                <button onClick={() => window.open(gmailUrl, "_blank")}
-                  style={{ flex:1, padding:"10px", background:"#ea4335", color:"#fff", border:"none", borderRadius:"8px", fontWeight:"700", cursor:"pointer", fontSize:"13px" }}>
-                  Open Gmail
-                </button>
-                <button onClick={() => window.open(mailtoUrl, "_blank")}
-                  style={{ flex:1, padding:"10px", background:"var(--accent)", color:"#000", border:"none", borderRadius:"8px", fontWeight:"700", cursor:"pointer", fontSize:"13px" }}>
-                  Open Mail App
-                </button>
-                <button onClick={() => { setMailJob(null); setMailTo(""); }}
-                  style={{ flex:1, padding:"10px", background:"var(--border)", color:"var(--text)", border:"1px solid var(--border)", borderRadius:"8px", cursor:"pointer", fontSize:"13px" }}>
-                  Cancel
+              {/* Message preview (shown before sending) */}
+              {!msgLoading && !msgResult && (
+                <div style={{ marginBottom:"18px" }}>
+                  <label style={{ fontSize:"12px", color:"var(--muted)", display:"block", marginBottom:"6px" }}>Message that will be sent to people at {msgJob.company}:</label>
+                  <textarea readOnly value={preview} rows={9}
+                    style={{ width:"100%", padding:"10px", borderRadius:"8px", border:"1px solid var(--border)", background:"var(--bg)", color:"var(--muted)", fontSize:"12px", lineHeight:"1.6", resize:"none", boxSizing:"border-box" }}
+                  />
+                </div>
+              )}
+
+              <div style={{ display:"flex", gap:"8px" }}>
+                {!msgLoading && !msgResult && (
+                  <button onClick={() => handleSendMessage(msgJob)}
+                    style={{ flex:1, padding:"11px", background:"var(--li)", color:"#fff", border:"none", borderRadius:"8px", fontWeight:"700", cursor:"pointer", fontSize:"13px" }}>
+                    🔵 Send on LinkedIn
+                  </button>
+                )}
+                <button onClick={() => { setMsgJob(null); setMsgResult(null); setMsgLoading(false); }}
+                  style={{ flex:1, padding:"11px", background:"var(--border)", color:"var(--text)", border:"1px solid var(--border)", borderRadius:"8px", cursor:"pointer", fontSize:"13px" }}>
+                  {msgResult ? "Close" : "Cancel"}
                 </button>
               </div>
             </div>

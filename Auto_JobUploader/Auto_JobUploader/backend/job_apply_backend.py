@@ -130,6 +130,13 @@ class MarkAppliedRequest(BaseModel):
     experience: Optional[str] = None
     salary: Optional[str] = None
 
+class LinkedInMessageRequest(BaseModel):
+    email: str
+    password: str
+    job_title: str
+    company: str
+    job_url: str
+
 class ApplyWithJobRequest(BaseModel):
     """Apply request that carries full job data — no job_store lookup needed."""
     platform: str
@@ -164,283 +171,190 @@ def human_delay(min_s=1.5, max_s=3.5):
 # ──────────────────────────────────────────
 # LinkedIn Automation (Selenium)
 # ──────────────────────────────────────────
+# Maps user-selected experience range → LinkedIn f_E experience level codes
+# f_E=1 Internship, 2 Entry level, 3 Associate, 4 Mid-Senior, 5 Director, 6 Executive
+_EXPERIENCE_FILTER: dict = {
+    "0-1":  "1,2",   # Fresher  → Internship + Entry level
+    "0-3":  "1,2",   # Junior   → Internship + Entry level
+    "2-5":  "3,4",   # Mid      → Associate + Mid-Senior
+    "5-10": "4,5",   # Senior   → Mid-Senior + Director
+}
+
+_CITY_ALIASES: dict = {
+    # key = what the user might type → canonical LinkedIn location string
+    "banglore":    "Bengaluru, Karnataka, India",
+    "bangalore":   "Bengaluru, Karnataka, India",
+    "bengaluru":   "Bengaluru, Karnataka, India",
+    "mumbai":      "Mumbai, Maharashtra, India",
+    "bombay":      "Mumbai, Maharashtra, India",
+    "pune":        "Pune, Maharashtra, India",
+    "delhi":       "Delhi, India",
+    "new delhi":   "New Delhi, Delhi, India",
+    "hyderabad":   "Hyderabad, Telangana, India",
+    "chennai":     "Chennai, Tamil Nadu, India",
+    "madras":      "Chennai, Tamil Nadu, India",
+    "kolkata":     "Kolkata, West Bengal, India",
+    "calcutta":    "Kolkata, West Bengal, India",
+    "ahmedabad":   "Ahmedabad, Gujarat, India",
+    "noida":       "Noida, Uttar Pradesh, India",
+    "gurgaon":     "Gurugram, Haryana, India",
+    "gurugram":    "Gurugram, Haryana, India",
+    "remote":      "India",
+    "india":       "India",
+}
+
+def _normalize_location(raw: str) -> str:
+    """Return the canonical LinkedIn location string for a user-typed city name."""
+    key = raw.strip().lower()
+    return _CITY_ALIASES.get(key, raw.strip())
+
+def _location_matches(job_loc: str, search_loc: str) -> bool:
+    """Return True if the job's location is relevant to the searched location."""
+    if not job_loc:
+        return True
+    jl = job_loc.lower()
+    # Accept any word from the searched location that's at least 3 chars long
+    for word in search_loc.lower().split():
+        if len(word) >= 3 and word in jl:
+            return True
+    # Accept common alias words (bangalore ↔ bengaluru)
+    alias_groups = [
+        {"bangalore", "bengaluru", "banglore", "karnataka"},
+        {"mumbai", "bombay", "maharashtra"},
+        {"delhi", "new delhi", "ncr"},
+        {"hyderabad", "telangana"},
+        {"chennai", "madras", "tamil"},
+        {"kolkata", "calcutta", "bengal"},
+        {"pune", "maharashtra"},
+        {"gurugram", "gurgaon", "haryana"},
+        {"noida", "uttar pradesh"},
+        {"ahmedabad", "gujarat"},
+    ]
+    sl = search_loc.lower()
+    for group in alias_groups:
+        if any(a in sl for a in group):
+            if any(a in jl for a in group):
+                return True
+    return False
+
+
 def linkedin_login_and_search(email: str, password: str, config: SearchConfig) -> List[Job]:
     """
-    Uses Selenium to log in to LinkedIn and collect job listings.
-    Returns list of Job objects.
+    Search LinkedIn jobs via the public guest HTTP API — no Selenium, no login needed.
+    Normalises the location string so LinkedIn filters correctly (e.g. "Banglore" →
+    "Bengaluru, Karnataka, India"), then post-filters results to the searched city.
     """
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.common.exceptions import TimeoutException, NoSuchElementException
+    import urllib.parse
+    from bs4 import BeautifulSoup
 
-    try:
-        driver = setup_chrome_driver()
-    except Exception as e:
-        logger.error(f"ChromeDriver initialization failed: {e}")
-        raise Exception(f"Failed to start browser automation: {str(e)}. Check that Chrome is installed.")
-    
-    wait = WebDriverWait(driver, 15)
+    # Normalise to the canonical form LinkedIn understands
+    canonical_location = _normalize_location(config.location)
+    exp_filter = _EXPERIENCE_FILTER.get(config.experience.strip(), "")
+    logger.info(
+        f"LinkedIn search: role='{config.role}'  location='{config.location}' → '{canonical_location}'"
+        f"  experience='{config.experience}' → f_E='{exp_filter}'"
+    )
+
     jobs: List[Job] = []
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://www.linkedin.com/jobs/search/",
+    }
 
-    try:
-        # ── LOGIN ──
-        logger.info("LinkedIn: Opening login page...")
-        driver.get("https://www.linkedin.com/login")
-        # Wait for the field — no fixed sleep needed
-        wait.until(EC.presence_of_element_located((By.ID, "username")))
-        driver.find_element(By.ID, "username").send_keys(email)
-        driver.find_element(By.ID, "password").send_keys(password)
-        driver.find_element(By.XPATH, "//button[@type='submit']").click()
+    fetched   = 0
+    start     = 0
+    batch_sz  = 25
+    max_fetch = min(config.max_jobs, 100)
 
-        # Wait for a definitive outcome instead of sleeping blindly
-        try:
-            WebDriverWait(driver, 8).until(lambda d: (
-                "feed" in d.current_url
-                or "checkpoint" in d.current_url
-                or "challenge" in d.current_url
-                or ("login" not in d.current_url and d.current_url != "https://www.linkedin.com/login")
-                or bool(d.find_elements(By.CSS_SELECTOR,
-                    "#error-for-password, #error-for-username, .alert-content"))
-            ))
-        except Exception:
-            pass
-
-        current_url = driver.current_url
-        logger.info(f"LinkedIn: URL after login: {current_url}")
-
-        if "checkpoint" in current_url or "challenge" in current_url or "verify" in current_url.lower():
-            raise Exception(
-                "🔐 LinkedIn Security Check Required. Log in manually on LinkedIn first, then try again."
-            )
-
-        still_on_login = "login" in current_url.lower() and "feed" not in current_url
-        if "error" in current_url.lower() or still_on_login:
-            raise Exception("❌ LinkedIn login failed. Check your email/password.")
-
-        # ── SEARCH ──
-        import urllib.parse
-        search_url = (
-            f"https://www.linkedin.com/jobs/search/"
+    while fetched < max_fetch:
+        api_url = (
+            "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
             f"?keywords={urllib.parse.quote(config.role)}"
-            f"&location={urllib.parse.quote(config.location)}"
-            f"&f_E=1%2C2%2C3"   # Entry/Associate/Mid
-            f"&f_AL=true"         # Easy Apply only
-            f"&sortBy=DD"         # Date Desc
-            f"&count=25"          # request more results per page
+            f"&location={urllib.parse.quote(canonical_location)}"
+            f"&start={start}"
+            f"&count={batch_sz}"
+            "&sortBy=DD"
+            "&f_TPR=r2592000"   # last 30 days for more results
+            + (f"&f_E={exp_filter}" if exp_filter else "")
         )
-        logger.info(f"LinkedIn: Searching jobs at {search_url}")
-        driver.get(search_url)
-
-        # Wait for page load + app-shell render — event-driven, no fixed sleep
-        logger.info("LinkedIn: Waiting for page to finish rendering...")
-        try:
-            WebDriverWait(driver, 15).until(lambda d: d.execute_script(
-                "return document.readyState === 'complete' && "
-                "document.documentElement.className.indexOf('app-loader--default') === -1;"
-            ))
-            logger.info("LinkedIn: App shell loaded")
-        except Exception:
-            pass
-        human_delay(1, 2)  # small buffer for React hydration
-
-        # Wait for any known job-list container to appear in the DOM
-        logger.info("LinkedIn: Waiting for job list container to load...")
-        container_css = (
-            "div.scaffold-layout__list-container,"
-            "div[class*='jobs-search-results-grid'],"
-            "ul[class*='jobs-search-results'],"
-            "div[class*='jobs-search-results'],"
-            "ul.jobs-search-results__list-wrapper,"
-            "div.jobs-search-results__list-wrapper"
-        )
-        try:
-            WebDriverWait(driver, 12).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, container_css))
-            )
-            logger.info("LinkedIn: Job list container found")
-        except Exception:
-            logger.warning("LinkedIn: Timeout waiting for job cards: could not find container, will scroll page")
-
-        # Scroll using pure JS — no Python element references passed to execute_script,
-        # so a React re-render can't produce a stale-handle crash.
-        SCROLL_JS = """
-            var sel = [
-                'div.scaffold-layout__list-container',
-                'ul.jobs-search-results__list-wrapper',
-                'div.jobs-search-results__list-wrapper',
-                'div[class*="jobs-search-results"]'
-            ];
-            var el = null;
-            for (var i = 0; i < sel.length; i++) {
-                el = document.querySelector(sel[i]);
-                if (el) break;
-            }
-            if (el) { el.scrollTop = el.scrollHeight; }
-            else     { window.scrollTo(0, document.body.scrollHeight); }
-        """
-        logger.info("LinkedIn: Scrolling to load more jobs...")
-        for scroll_num in range(3):
-            try:
-                driver.execute_script(SCROLL_JS)
-            except Exception:
-                pass
-            human_delay(1.0, 1.5)
-            logger.info(f"LinkedIn: Scroll {scroll_num + 1}/3")
+        logger.info(f"LinkedIn: GET {api_url}")
 
         try:
-            driver.execute_script("window.scrollTo(0, 0);")
-        except Exception:
-            pass
-        human_delay(0.5, 1.0)
+            resp = http_requests.get(api_url, headers=headers, timeout=20)
+        except Exception as e:
+            raise Exception(f"LinkedIn request failed: {e}")
 
-        # Now collect cards — fresh references after all scrolling is complete
-        logger.info("LinkedIn: Searching for job cards with multiple selectors...")
-        card_selectors = [
-            "li[data-occludable-job-id]",
-            "li[data-job-id]",
-            "div.job-card-container--clickable",
-            "div.job-card-container",
-            "li.jobs-search-results__list-item",
-            "li.scaffold-layout__list-item",
-            "li.base-card",
-            "article.base-card",
-            "div.base-card.base-card--clickable",
-            "[data-job-id]",
-            "li[data-list-index]",
-            "article.jobs-search-results__list-item",
-        ]
+        logger.info(f"LinkedIn: status={resp.status_code}  bytes={len(resp.content)}")
 
-        cards = []
-        used_selector = None
-        for selector in card_selectors:
-            try:
-                elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                if elements:
-                    cards = elements
-                    used_selector = selector
-                    logger.info(f"LinkedIn: Found {len(cards)} cards using selector: {selector}")
-                    break
-            except Exception as e:
-                logger.debug(f"LinkedIn: Selector '{selector}' failed: {e}")
+        if resp.status_code == 429:
+            raise Exception("LinkedIn rate-limited this request. Wait a minute and try again.")
+        if resp.status_code != 200:
+            if start == 0:
+                raise Exception(f"LinkedIn returned HTTP {resp.status_code}. Try again shortly.")
+            break
 
+        soup = BeautifulSoup(resp.text, "html.parser")
+        cards = soup.find_all("li")
         if not cards:
-            logger.warning("LinkedIn: No job cards found with any selector!")
-            page_source = driver.page_source
-            if "LinkedIn is blocking this" in page_source or "unusual activity" in page_source:
-                raise Exception(
-                    "LinkedIn detected unusual activity. "
-                    "Log in manually first, then try again."
-                )
+            break
 
-        logger.info(f"LinkedIn: Found {len(cards)} job cards total")
+        batch_added = 0
+        for card in cards:
+            title_el = (card.find("h3", class_="base-search-card__title") or
+                        card.find("h3", class_="job-search-card__title") or
+                        card.find("h3"))
+            title = title_el.get_text(strip=True) if title_el else ""
 
-        for i, card in enumerate(cards[:config.max_jobs]):
-            try:
-                # Guard: if LinkedIn replaced the DOM element it becomes stale — skip cleanly
-                _ = card.tag_name
-            except Exception:
-                logger.debug(f"LinkedIn: Card {i} is stale, skipping")
+            company_el = (card.find("h4", class_="base-search-card__subtitle") or
+                          card.find("a",  class_="job-search-card__company-name") or
+                          card.find("h4"))
+            company = company_el.get_text(strip=True) if company_el else ""
+
+            loc_el = (card.find("span", class_="job-search-card__location") or
+                      card.find("span", class_="base-search-card__metadata"))
+            job_location = loc_el.get_text(strip=True) if loc_el else ""
+
+            link_el = (card.find("a", class_="base-card__full-link") or
+                       card.find("a", href=lambda h: h and "/jobs/view/" in h))
+            job_url = link_el["href"].split("?")[0] if link_el else "#"
+
+            if not title and not company:
                 continue
 
-            try:
-                # Try to get title
-                title = "N/A"
-                for title_sel in [
-                    "a.job-card-list__title--link",
-                    "a.job-card-list__title",
-                    "strong.t-bold",
-                    "a[data-control-name='jobcard_title']",
-                ]:
-                    try:
-                        title = card.find_element(By.CSS_SELECTOR, title_sel).text.strip()
-                        if title:
-                            break
-                    except Exception:
-                        pass
-                if title == "N/A":
-                    links = card.find_elements(By.TAG_NAME, "a")
-                    title = links[0].text.strip() if links else "N/A"
-
-                # Try to get company
-                company = "N/A"
-                for co_sel in [
-                    "span.job-card-container__primary-description",
-                    "div.artdeco-entity-lockup__subtitle span",
-                    "span.base-search-card__subtitle",
-                    "a.job-card-container__company-name",
-                    "span[class*='company']",
-                ]:
-                    try:
-                        company = card.find_element(By.CSS_SELECTOR, co_sel).text.strip()
-                        if company:
-                            break
-                    except Exception:
-                        pass
-
-                # Try to get location
-                location = config.location
-                for loc_sel in [
-                    "li.job-card-container__metadata-item",
-                    "div.artdeco-entity-lockup__caption span",
-                    "span.job-search-card__location",
-                    "span[class*='location']",
-                    "ul.job-card-container__metadata-wrapper li",
-                ]:
-                    try:
-                        location = card.find_element(By.CSS_SELECTOR, loc_sel).text.strip()
-                        if location:
-                            break
-                    except Exception:
-                        pass
-
-                # Try to get URL
-                job_url = "#"
-                for url_sel in [
-                    "a.job-card-list__title--link",
-                    "a.job-card-list__title",
-                    "a[data-control-name='jobcard_title']",
-                ]:
-                    try:
-                        job_url = card.find_element(By.CSS_SELECTOR, url_sel).get_attribute("href") or "#"
-                        if job_url != "#":
-                            break
-                    except Exception:
-                        pass
-                if job_url == "#":
-                    links = card.find_elements(By.TAG_NAME, "a")
-                    job_url = links[0].get_attribute("href") if links else "#"
-                
-                if job_url and job_url != "#":
-                    job_url = job_url.split("?")[0]
-                
-                if title == "N/A" and company == "N/A":
-                    logger.debug(f"LinkedIn: Skipping empty card {i} (not yet hydrated)")
-                    continue
-
-                job_id = f"li_{i}_{int(time.time())}"
-
-                jobs.append(Job(
-                    id=job_id,
-                    title=title,
-                    company=company,
-                    location=location,
-                    experience=config.experience + " yrs",
-                    salary=None,
-                    posted="Recent",
-                    platform="linkedin",
-                    url=job_url,
-                    status="pending"
-                ))
-                logger.info(f"LinkedIn: Found job {i+1}: {title} @ {company}")
-            except Exception as e:
-                logger.warning(f"LinkedIn: Could not parse card {i}: {e}")
+            # Post-filter: skip jobs that are clearly from a different location
+            if job_location and not _location_matches(job_location, canonical_location):
+                logger.debug(f"LinkedIn: skipping {title} — location '{job_location}' != '{canonical_location}'")
                 continue
 
-    finally:
-        driver.quit()
+            idx = len(jobs)
+            jobs.append(Job(
+                id=f"li_{idx}_{int(time.time())}",
+                title=title or "N/A",
+                company=company or "N/A",
+                location=job_location or canonical_location,
+                experience=config.experience + " yrs",
+                salary=None,
+                posted="Recent",
+                platform="linkedin",
+                url=job_url,
+                status="pending"
+            ))
+            logger.info(f"LinkedIn: [{idx+1}] {title} @ {company} — {job_location}")
+            batch_added += 1
+            fetched += 1
+            if fetched >= max_fetch:
+                break
 
+        if batch_added == 0:
+            break
+        start += batch_sz
+
+    logger.info(f"LinkedIn: {len(jobs)} jobs for '{config.role}' in '{canonical_location}'")
     return jobs
 
 
@@ -1100,6 +1014,213 @@ def _naukri_validate(email: str, password: str) -> dict:
 # ──────────────────────────────────────────
 # API ROUTES
 # ──────────────────────────────────────────
+
+
+@app.post("/api/linkedin-message")
+def linkedin_send_message(req: LinkedInMessageRequest):
+    """
+    Navigate to a LinkedIn job page, find 'People you can reach out to',
+    and send each of them a personalized interest message.
+    """
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+
+    driver = None
+    try:
+        driver = setup_chrome_driver(headless=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Browser failed to start: {str(e)[:100]}")
+
+    try:
+        # ── LOGIN ──────────────────────────────────────────────────────────
+        driver.get("https://www.linkedin.com/login")
+        time.sleep(4)
+
+        driver.execute_script("""
+            function fill(sel, val) {
+                var el = document.querySelector(sel);
+                if (!el) return;
+                var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
+                setter.call(el, val);
+                el.dispatchEvent(new Event('input',  {bubbles:true}));
+                el.dispatchEvent(new Event('change', {bubbles:true}));
+            }
+            fill('#username', arguments[0]);
+            fill('#password', arguments[1]);
+        """, req.email, req.password)
+        time.sleep(1)
+
+        driver.execute_script(
+            "var b=document.querySelector('button[type=\"submit\"]'); if(b) b.click();"
+        )
+        for _ in range(20):
+            time.sleep(1)
+            url = driver.execute_script("return window.location.href") or ""
+            if "linkedin.com/login" not in url:
+                break
+
+        url = driver.execute_script("return window.location.href") or ""
+        if "linkedin.com/login" in url:
+            raise HTTPException(status_code=401, detail="❌ Login failed. Check credentials.")
+        if any(x in url for x in ("checkpoint", "challenge", "verify")):
+            raise HTTPException(status_code=401, detail="🔐 Security check required. Log in manually first.")
+
+        # ── JOB PAGE ───────────────────────────────────────────────────────
+        logger.info(f"LinkedIn Message: opening job page {req.job_url}")
+        driver.get(req.job_url)
+        time.sleep(5)
+
+        # Scroll to reveal the people section
+        for scroll_to in [600, 1200, 1800, 0]:
+            driver.execute_script(f"window.scrollTo(0, {scroll_to});")
+            time.sleep(1.5)
+
+        # ── FIND MESSAGE BUTTONS ────────────────────────────────────────────
+        msg_button_sels = (
+            'button[aria-label*="Message"], '
+            'button.message-anywhere-button, '
+            'button[aria-label*="message"], '
+            'a[aria-label*="Message"], '
+            'button[data-control-name*="message"]'
+        )
+        msg_buttons = driver.find_elements(By.CSS_SELECTOR, msg_button_sels)
+        logger.info(f"LinkedIn Message: found {len(msg_buttons)} message button(s)")
+
+        if not msg_buttons:
+            # Try to at least name who's there for a helpful error
+            found_names = driver.execute_script("""
+                var sels = ['.jobs-poster__name','.hirer-card__hirer-information strong',
+                            'span[aria-hidden="true"]','.artdeco-entity-lockup__title span'];
+                var names = [];
+                sels.forEach(function(s){
+                    document.querySelectorAll(s).forEach(function(el){
+                        var t=el.textContent.trim();
+                        if(t && t.length<60 && !names.includes(t)) names.push(t);
+                    });
+                });
+                return names.slice(0,5);
+            """)
+            detail = "No 'People you can reach out to' found on this job page."
+            if found_names:
+                detail += f" Saw names: {', '.join(found_names)} — but no Message button."
+            raise HTTPException(status_code=404, detail=detail)
+
+        sender_name = req.email.split("@")[0].replace(".", " ").title()
+        messaged, failed = [], []
+
+        for i, btn in enumerate(msg_buttons[:3]):   # message up to 3 people
+            # Resolve person name from button label or nearby DOM
+            person_name = driver.execute_script("""
+                var btn = arguments[0];
+                var label = btn.getAttribute('aria-label') || '';
+                var m = label.match(/[Mm]essage\\s+(.+)/);
+                if (m) return m[1].trim();
+                var card = btn.closest('li, [class*="hirer"], [class*="poster"], [class*="insight"]');
+                if (card) {
+                    var el = card.querySelector('[class*="name"], strong, h3, span[aria-hidden="true"]');
+                    if (el) return el.textContent.trim();
+                }
+                return 'there';
+            """, btn)
+
+            msg_text = (
+                f"Hi {person_name}, I came across the {req.job_title} position at {req.company} "
+                f"and I'm genuinely excited about this opportunity.\n\n"
+                f"With my background and passion for this field, I believe I could be a strong "
+                f"fit for the team. I'd love to connect briefly to learn more about the role and "
+                f"share how I could contribute.\n\n"
+                f"Would you be open to a quick chat? Thank you so much for your time!\n\n"
+                f"Best regards,\n{sender_name}"
+            )
+
+            try:
+                # Scroll button into view and click
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                time.sleep(0.5)
+                driver.execute_script("arguments[0].click();", btn)
+                time.sleep(3)
+
+                # Find the contenteditable message box (LinkedIn chat overlay)
+                textarea = None
+                for sel in [
+                    'div.msg-form__contenteditable[contenteditable="true"]',
+                    '.msg-form__contenteditable',
+                    'div[contenteditable="true"][data-placeholder]',
+                    'div[role="textbox"]',
+                ]:
+                    els = driver.find_elements(By.CSS_SELECTOR, sel)
+                    if els:
+                        textarea = els[-1]
+                        break
+
+                if not textarea:
+                    logger.warning(f"LinkedIn Message: no textarea found for {person_name}")
+                    failed.append(person_name)
+                    # Try closing the modal
+                    driver.execute_script("""
+                        var c=document.querySelector('button[aria-label="Close"],.msg-overlay-bubble-header__controls button');
+                        if(c) c.click();
+                    """)
+                    continue
+
+                # Click to focus, then inject text via execCommand (works in contenteditable)
+                driver.execute_script("arguments[0].click(); arguments[0].focus();", textarea)
+                time.sleep(0.5)
+                driver.execute_script(
+                    "arguments[0].textContent='';"
+                    "document.execCommand('selectAll',false,null);"
+                    "document.execCommand('insertText',false,arguments[1]);",
+                    textarea, msg_text
+                )
+                time.sleep(1)
+
+                # Click Send button
+                sent = False
+                for send_sel in [
+                    'button.msg-form__send-button',
+                    'button[aria-label="Send"]',
+                    'button[type="submit"].msg-form__send-button',
+                ]:
+                    send_btns = driver.find_elements(By.CSS_SELECTOR, send_sel)
+                    if send_btns:
+                        driver.execute_script("arguments[0].click();", send_btns[-1])
+                        time.sleep(2)
+                        sent = True
+                        break
+
+                if not sent:
+                    try:
+                        textarea.send_keys(Keys.CONTROL + Keys.RETURN)
+                        time.sleep(2)
+                        sent = True
+                    except Exception:
+                        pass
+
+                if sent:
+                    messaged.append(person_name)
+                    logger.info(f"LinkedIn Message: ✅ Sent to {person_name}")
+                else:
+                    failed.append(person_name)
+
+                time.sleep(2)
+
+            except Exception as e:
+                logger.warning(f"LinkedIn Message: error for {person_name}: {e}")
+                failed.append(person_name)
+
+        return {"messaged": messaged, "failed": failed, "total_found": len(msg_buttons)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"LinkedIn Message error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)[:150]}")
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 @app.post("/api/validate-credentials")
