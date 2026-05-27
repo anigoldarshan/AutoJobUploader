@@ -160,6 +160,7 @@ class BulkApplyRequest(BaseModel):
 # ──────────────────────────────────────────
 job_store: dict[str, Job] = {}
 session_tokens: dict[str, str] = {}
+_linkedin_cookies: dict = {}   # email → list of cookie dicts saved after validation
 
 # ──────────────────────────────────────────
 # Utility: Human-like delay
@@ -926,6 +927,12 @@ def _linkedin_validate(email: str, password: str) -> dict:
         logger.info(f"LinkedIn validate: post-login url = {url}")
 
         if "/feed" in url or "/mynetwork" in url:
+            # Cache cookies so the message endpoint can reuse this session
+            try:
+                _linkedin_cookies[email] = driver.get_cookies()
+                logger.info(f"LinkedIn validate: cached {len(_linkedin_cookies[email])} cookies for {email}")
+            except Exception:
+                pass
             return {"valid": True}
 
         if any(x in url for x in ("checkpoint", "challenge", "verify")):
@@ -1027,38 +1034,58 @@ def linkedin_send_message(req: LinkedInMessageRequest):
 
     driver = None
     try:
-        # Non-headless for message — LinkedIn blocks headless login more aggressively
-        # for account-level actions vs. the public search API.
-        driver = setup_chrome_driver(headless=False)
+        driver = setup_chrome_driver(headless=True)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Browser failed to start: {str(e)[:100]}")
 
     try:
-        # ── LOGIN ──────────────────────────────────────────────────────────
-        driver.get("https://www.linkedin.com/login")
-        time.sleep(4)   # let page fully render
+        # ── RESTORE SESSION (reuse cookies from validation — no login needed) ──
+        saved_cookies = _linkedin_cookies.get(req.email, [])
+        logged_in = False
 
-        # Same JS pattern as _linkedin_validate (proven to work)
-        driver.execute_script("""
-            var u = document.getElementById('username');
-            var p = document.getElementById('password');
-            if (u) { u.value = arguments[0]; u.dispatchEvent(new Event('input', {bubbles:true})); }
-            if (p) { p.value = arguments[1]; p.dispatchEvent(new Event('input', {bubbles:true})); }
-        """, req.email, req.password)
-        time.sleep(0.5)
+        if saved_cookies:
+            logger.info(f"LinkedIn Message: restoring session from {len(saved_cookies)} cached cookies")
+            driver.get("https://www.linkedin.com/")
+            time.sleep(2)
+            for ck in saved_cookies:
+                try:
+                    driver.add_cookie(ck)
+                except Exception:
+                    pass
+            driver.get("https://www.linkedin.com/feed/")
+            time.sleep(4)
+            url = driver.execute_script("return window.location.href") or ""
+            logger.info(f"LinkedIn Message: after cookie restore, URL = {url}")
+            if any(p in url for p in ("/feed", "/mynetwork", "/jobs", "/in/")):
+                logged_in = True
+                logger.info("LinkedIn Message: ✅ Logged in via saved cookies — skipping login form")
 
-        driver.execute_script(
-            "var b = document.querySelector('button[type=\"submit\"]'); if(b) b.click();"
-        )
-        time.sleep(8)   # wait for redirect
-
-        url = driver.execute_script("return window.location.href") or ""
-        logger.info(f"LinkedIn Message: post-login url = {url}")
-
-        if "linkedin.com/login" in url:
-            raise HTTPException(status_code=401, detail="❌ Login failed. Check credentials.")
-        if any(x in url for x in ("checkpoint", "challenge", "verify")):
-            raise HTTPException(status_code=401, detail="🔐 Security check required. Log in manually first.")
+        if not logged_in:
+            logger.info("LinkedIn Message: cookies invalid/missing — doing fresh login")
+            driver.get("https://www.linkedin.com/login")
+            time.sleep(4)
+            driver.execute_script("""
+                var u = document.getElementById('username');
+                var p = document.getElementById('password');
+                if (u) { u.value = arguments[0]; u.dispatchEvent(new Event('input', {bubbles:true})); }
+                if (p) { p.value = arguments[1]; p.dispatchEvent(new Event('input', {bubbles:true})); }
+            """, req.email, req.password)
+            time.sleep(0.5)
+            driver.execute_script(
+                "var b = document.querySelector('button[type=\"submit\"]'); if(b) b.click();"
+            )
+            time.sleep(8)
+            url = driver.execute_script("return window.location.href") or ""
+            logger.info(f"LinkedIn Message: post-login url = {url}")
+            if "linkedin.com/login" in url:
+                raise HTTPException(status_code=401, detail="❌ Login failed. Check credentials.")
+            if any(x in url for x in ("checkpoint", "challenge", "verify")):
+                raise HTTPException(status_code=401, detail="🔐 Security check required. Log in manually first.")
+            # Cache for next time
+            try:
+                _linkedin_cookies[req.email] = driver.get_cookies()
+            except Exception:
+                pass
 
         # ── JOB PAGE ───────────────────────────────────────────────────────
         logger.info(f"LinkedIn Message: opening job page {req.job_url}")
