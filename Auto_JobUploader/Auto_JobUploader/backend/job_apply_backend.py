@@ -1027,39 +1027,34 @@ def linkedin_send_message(req: LinkedInMessageRequest):
 
     driver = None
     try:
-        driver = setup_chrome_driver(headless=True)
+        # Non-headless for message — LinkedIn blocks headless login more aggressively
+        # for account-level actions vs. the public search API.
+        driver = setup_chrome_driver(headless=False)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Browser failed to start: {str(e)[:100]}")
 
     try:
         # ── LOGIN ──────────────────────────────────────────────────────────
         driver.get("https://www.linkedin.com/login")
-        time.sleep(4)
+        time.sleep(4)   # let page fully render
 
+        # Same JS pattern as _linkedin_validate (proven to work)
         driver.execute_script("""
-            function fill(sel, val) {
-                var el = document.querySelector(sel);
-                if (!el) return;
-                var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
-                setter.call(el, val);
-                el.dispatchEvent(new Event('input',  {bubbles:true}));
-                el.dispatchEvent(new Event('change', {bubbles:true}));
-            }
-            fill('#username', arguments[0]);
-            fill('#password', arguments[1]);
+            var u = document.getElementById('username');
+            var p = document.getElementById('password');
+            if (u) { u.value = arguments[0]; u.dispatchEvent(new Event('input', {bubbles:true})); }
+            if (p) { p.value = arguments[1]; p.dispatchEvent(new Event('input', {bubbles:true})); }
         """, req.email, req.password)
-        time.sleep(1)
+        time.sleep(0.5)
 
         driver.execute_script(
-            "var b=document.querySelector('button[type=\"submit\"]'); if(b) b.click();"
+            "var b = document.querySelector('button[type=\"submit\"]'); if(b) b.click();"
         )
-        for _ in range(20):
-            time.sleep(1)
-            url = driver.execute_script("return window.location.href") or ""
-            if "linkedin.com/login" not in url:
-                break
+        time.sleep(8)   # wait for redirect
 
         url = driver.execute_script("return window.location.href") or ""
+        logger.info(f"LinkedIn Message: post-login url = {url}")
+
         if "linkedin.com/login" in url:
             raise HTTPException(status_code=401, detail="❌ Login failed. Check credentials.")
         if any(x in url for x in ("checkpoint", "challenge", "verify")):
