@@ -328,7 +328,7 @@ export default function App() {
   const [page, setPage]         = useState("dashboard");
   const [jobs, setJobs]         = useState([]);
   const [log,  setLog]          = useState([]);
-  const [stats, setStats]       = useState({ total:0, pending:0, applied:0, failed:0, applying:0 });
+  const [stats, setStats]       = useState({ total:0, pending:0, applied:0, failed:0, applying:0, db_applied:0, db_total:0 });
   const [loading, setLoading]   = useState(false);
   const [toast, setToast]       = useState(null);
   const [filter, setFilter]     = useState("all");
@@ -1051,7 +1051,7 @@ export default function App() {
       {/* LinkedIn Message Modal */}
       {msgJob && (() => {
         const senderName = (user?.email || "").split("@")[0].replace(".", " ");
-        const preview = `Hi [Name], I came across the ${msgJob.title} position at ${msgJob.company} and I'm genuinely excited about this opportunity.\n\nWith my background and passion for this field, I believe I could be a strong fit for the team. I'd love to connect briefly to learn more about the role and share how I could contribute.\n\nWould you be open to a quick chat? Thank you so much for your time!\n\nBest regards,\n${senderName}`;
+        const preview = `Hi [Name], I saw the ${msgJob.title} role at ${msgJob.company} and I'm genuinely interested. I'd love to connect and learn more about the opportunity. Thank you!\n\n(Sent as a LinkedIn connection request with a note — works on free accounts)`;
         return (
           <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:999 }}>
             <div style={{ background:"var(--surface)", border:"1px solid var(--border)", borderRadius:"16px", padding:"28px", maxWidth:"520px", width:"90%", color:"var(--text)" }}>
@@ -1067,21 +1067,26 @@ export default function App() {
               )}
 
               {/* Success */}
-              {!msgLoading && msgResult?.success && (
+              {!msgLoading && msgResult?.success && msgResult.messaged?.length > 0 && (
                 <div>
                   <div style={{ background:"rgba(34,197,94,0.1)", border:"1px solid #22c55e", borderRadius:"10px", padding:"14px", marginBottom:"14px" }}>
-                    <div style={{ fontWeight:"700", color:"#22c55e", marginBottom:"6px" }}>✅ Messages sent successfully!</div>
-                    {msgResult.messaged.length > 0 && (
-                      <div style={{ fontSize:"13px" }}>
-                        <span style={{ color:"var(--muted)" }}>Messaged: </span>
-                        {msgResult.messaged.join(", ")}
-                      </div>
-                    )}
-                    {msgResult.failed.length > 0 && (
+                    <div style={{ fontWeight:"700", color:"#22c55e", marginBottom:"6px" }}>
+                      ✅ {msgResult.action === "connection request(s)" ? "Connection request sent!" : "Message sent!"}
+                    </div>
+                    <div style={{ fontSize:"13px" }}>
+                      <span style={{ color:"var(--muted)" }}>Sent to: </span>
+                      {msgResult.messaged.join(", ")}
+                    </div>
+                    {msgResult.failed?.length > 0 && (
                       <div style={{ fontSize:"12px", color:"var(--yellow)", marginTop:"6px" }}>
-                        Could not message: {msgResult.failed.join(", ")}
+                        Could not reach: {msgResult.failed.join(", ")}
                       </div>
                     )}
+                    <div style={{ fontSize:"11px", color:"var(--muted)", marginTop:"8px" }}>
+                      {msgResult.action === "connection request(s)"
+                        ? "💡 A connection request with a personalized note was sent (free account)."
+                        : "💡 A direct LinkedIn message was sent (Premium)."}
+                    </div>
                   </div>
                 </div>
               )}

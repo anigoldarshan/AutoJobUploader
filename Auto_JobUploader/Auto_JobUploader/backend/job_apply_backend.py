@@ -1097,140 +1097,228 @@ def linkedin_send_message(req: LinkedInMessageRequest):
             driver.execute_script(f"window.scrollTo(0, {scroll_to});")
             time.sleep(1.5)
 
-        # ── FIND MESSAGE BUTTONS ────────────────────────────────────────────
-        msg_button_sels = (
-            'button[aria-label*="Message"], '
-            'button.message-anywhere-button, '
-            'button[aria-label*="message"], '
-            'a[aria-label*="Message"], '
-            'button[data-control-name*="message"]'
-        )
-        msg_buttons = driver.find_elements(By.CSS_SELECTOR, msg_button_sels)
-        logger.info(f"LinkedIn Message: found {len(msg_buttons)} message button(s)")
+        # ── FIND CONNECT or MESSAGE BUTTONS in the "People you can reach out to" section ──
+        # Connect = free tier (sends connection request + note, ≤300 chars)
+        # Message = LinkedIn Premium only
+        connect_btns = driver.find_elements(By.CSS_SELECTOR,
+            'button[aria-label*="Connect"], button[aria-label*="Invite"]')
+        message_btns = driver.find_elements(By.CSS_SELECTOR,
+            'button[aria-label*="Message"], button.message-anywhere-button, '
+            'button[aria-label*="message"]')
 
-        if not msg_buttons:
-            # Try to at least name who's there for a helpful error
+        # Prefer Connect (works on free accounts); use Message only if no Connect found
+        action_buttons = connect_btns if connect_btns else message_btns
+        use_connect = bool(connect_btns)
+
+        logger.info(f"LinkedIn Message: connect={len(connect_btns)}  message={len(message_btns)}  "
+                    f"using={'connect' if use_connect else 'message'}")
+
+        if not action_buttons:
             found_names = driver.execute_script("""
                 var sels = ['.jobs-poster__name','.hirer-card__hirer-information strong',
                             'span[aria-hidden="true"]','.artdeco-entity-lockup__title span'];
                 var names = [];
                 sels.forEach(function(s){
                     document.querySelectorAll(s).forEach(function(el){
-                        var t=el.textContent.trim();
-                        if(t && t.length<60 && !names.includes(t)) names.push(t);
+                        var t = el.textContent.trim();
+                        if (t && t.length < 60 && !names.includes(t)) names.push(t);
                     });
                 });
-                return names.slice(0,5);
+                return names.slice(0, 5);
             """)
             detail = "No 'People you can reach out to' found on this job page."
             if found_names:
-                detail += f" Saw names: {', '.join(found_names)} — but no Message button."
+                detail += f" Saw: {', '.join(found_names)} — but no Connect/Message button."
             raise HTTPException(status_code=404, detail=detail)
 
         sender_name = req.email.split("@")[0].replace(".", " ").title()
         messaged, failed = [], []
 
-        for i, btn in enumerate(msg_buttons[:3]):   # message up to 3 people
-            # Resolve person name from button label or nearby DOM
+        for i, btn in enumerate(action_buttons[:3]):
+            # Resolve the person's name from aria-label or nearby DOM
             person_name = driver.execute_script("""
                 var btn = arguments[0];
                 var label = btn.getAttribute('aria-label') || '';
-                var m = label.match(/[Mm]essage\\s+(.+)/);
+                var m = label.match(/(?:Connect with|Invite|Message)\\s+(.+)/i);
                 if (m) return m[1].trim();
-                var card = btn.closest('li, [class*="hirer"], [class*="poster"], [class*="insight"]');
+                var card = btn.closest('li, [class*="hirer"], [class*="poster"], [class*="insight"], [class*="people"]');
                 if (card) {
-                    var el = card.querySelector('[class*="name"], strong, h3, span[aria-hidden="true"]');
-                    if (el) return el.textContent.trim();
+                    var candidates = card.querySelectorAll(
+                        '[class*="name"], strong, h3, h4, span[aria-hidden="true"], .artdeco-entity-lockup__title span'
+                    );
+                    for (var j = 0; j < candidates.length; j++) {
+                        var t = candidates[j].textContent.trim();
+                        if (t && t.length > 1 && t.length < 60) return t;
+                    }
                 }
                 return 'there';
             """, btn)
 
-            msg_text = (
-                f"Hi {person_name}, I came across the {req.job_title} position at {req.company} "
-                f"and I'm genuinely excited about this opportunity.\n\n"
-                f"With my background and passion for this field, I believe I could be a strong "
-                f"fit for the team. I'd love to connect briefly to learn more about the role and "
-                f"share how I could contribute.\n\n"
-                f"Would you be open to a quick chat? Thank you so much for your time!\n\n"
-                f"Best regards,\n{sender_name}"
-            )
+            # Connection note must be ≤ 300 characters
+            note = (
+                f"Hi {person_name}, I saw the {req.job_title} role at {req.company} "
+                f"and I'm genuinely interested. I'd love to connect and learn more "
+                f"about the opportunity. Thank you!"
+            )[:300]
 
             try:
-                # Scroll button into view and click
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-                time.sleep(0.5)
-                driver.execute_script("arguments[0].click();", btn)
+                time.sleep(0.8)
+                try:
+                    btn.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", btn)
                 time.sleep(3)
 
-                # Find the contenteditable message box (LinkedIn chat overlay)
-                textarea = None
-                for sel in [
-                    'div.msg-form__contenteditable[contenteditable="true"]',
-                    '.msg-form__contenteditable',
-                    'div[contenteditable="true"][data-placeholder]',
-                    'div[role="textbox"]',
-                ]:
-                    els = driver.find_elements(By.CSS_SELECTOR, sel)
-                    if els:
-                        textarea = els[-1]
-                        break
+                if use_connect:
+                    # ── CONNECTION REQUEST FLOW ────────────────────────────
+                    # Click "Add a note" button in the modal
+                    add_note_clicked = False
+                    for note_sel in [
+                        'button[aria-label="Add a note"]',
+                        'button[aria-label*="Add a note"]',
+                        'button[data-control-name="send.with.note"]',
+                    ]:
+                        note_btns = driver.find_elements(By.CSS_SELECTOR, note_sel)
+                        if note_btns:
+                            driver.execute_script("arguments[0].click();", note_btns[0])
+                            add_note_clicked = True
+                            time.sleep(1.5)
+                            break
 
-                if not textarea:
-                    logger.warning(f"LinkedIn Message: no textarea found for {person_name}")
-                    failed.append(person_name)
-                    # Try closing the modal
-                    driver.execute_script("""
-                        var c=document.querySelector('button[aria-label="Close"],.msg-overlay-bubble-header__controls button');
-                        if(c) c.click();
-                    """)
-                    continue
+                    if not add_note_clicked:
+                        # Try finding by text content
+                        add_note_clicked = driver.execute_script("""
+                            var btns = document.querySelectorAll('button, span');
+                            for (var i = 0; i < btns.length; i++) {
+                                if (/add a note/i.test(btns[i].textContent)) {
+                                    btns[i].click(); return true;
+                                }
+                            }
+                            return false;
+                        """)
+                        if add_note_clicked:
+                            time.sleep(1.5)
 
-                # Click to focus, then inject text via execCommand (works in contenteditable)
-                driver.execute_script("arguments[0].click(); arguments[0].focus();", textarea)
-                time.sleep(0.5)
-                driver.execute_script(
-                    "arguments[0].textContent='';"
-                    "document.execCommand('selectAll',false,null);"
-                    "document.execCommand('insertText',false,arguments[1]);",
-                    textarea, msg_text
-                )
-                time.sleep(1)
+                    # Find the note textarea (regular <textarea>, not contenteditable)
+                    textarea = None
+                    for sel in [
+                        'textarea#custom-message',
+                        'textarea[name="message"]',
+                        'textarea[id*="message"]',
+                        'div[aria-label*="note"] textarea',
+                        'textarea',
+                    ]:
+                        els = driver.find_elements(By.CSS_SELECTOR, sel)
+                        visible = [e for e in els if e.is_displayed()]
+                        if visible:
+                            textarea = visible[-1]
+                            logger.info(f"LinkedIn Connect: note textarea found via '{sel}'")
+                            break
 
-                # Click Send button
-                sent = False
-                for send_sel in [
-                    'button.msg-form__send-button',
-                    'button[aria-label="Send"]',
-                    'button[type="submit"].msg-form__send-button',
-                ]:
-                    send_btns = driver.find_elements(By.CSS_SELECTOR, send_sel)
-                    if send_btns:
-                        driver.execute_script("arguments[0].click();", send_btns[-1])
-                        time.sleep(2)
-                        sent = True
-                        break
+                    if not textarea:
+                        logger.warning(f"LinkedIn Connect: note textarea not found for {person_name}")
+                        failed.append(person_name)
+                        driver.execute_script("""
+                            var c = document.querySelector('button[aria-label="Dismiss"], button[aria-label="Close"]');
+                            if (c) c.click();
+                        """)
+                        continue
 
-                if not sent:
-                    try:
-                        textarea.send_keys(Keys.CONTROL + Keys.RETURN)
-                        time.sleep(2)
-                        sent = True
-                    except Exception:
-                        pass
+                    # Type the note
+                    textarea.clear()
+                    textarea.send_keys(note)
+                    time.sleep(0.8)
+
+                    # Click "Send now" / "Send invitation"
+                    sent = False
+                    for send_sel in [
+                        'button[aria-label="Send now"]',
+                        'button[aria-label="Send invitation"]',
+                        'button[aria-label*="Send"]',
+                        'button.artdeco-button--primary[type="submit"]',
+                        'button[data-control-name="send.invitation"]',
+                    ]:
+                        send_btns = driver.find_elements(By.CSS_SELECTOR, send_sel)
+                        visible_send = [b for b in send_btns if b.is_displayed()]
+                        if visible_send:
+                            driver.execute_script("arguments[0].click();", visible_send[-1])
+                            time.sleep(2)
+                            sent = True
+                            logger.info(f"LinkedIn Connect: ✅ Connection request + note sent to {person_name}")
+                            break
+
+                else:
+                    # ── PREMIUM MESSAGE FLOW ───────────────────────────────
+                    time.sleep(2)
+                    textarea = None
+                    for sel in [
+                        'div.msg-form__contenteditable[contenteditable="true"]',
+                        '.msg-form__contenteditable',
+                        'div[contenteditable="true"][data-placeholder*="essage"]',
+                        'div[role="textbox"][contenteditable="true"]',
+                        'div[contenteditable="true"]',
+                    ]:
+                        els = driver.find_elements(By.CSS_SELECTOR, sel)
+                        visible = [e for e in els if e.is_displayed()]
+                        if visible:
+                            textarea = visible[-1]
+                            break
+
+                    if not textarea:
+                        failed.append(person_name)
+                        continue
+
+                    full_msg = (
+                        f"Hi {person_name}, I came across the {req.job_title} position at {req.company} "
+                        f"and I'm genuinely excited about this opportunity. With my background in this field, "
+                        f"I believe I could be a strong fit. Would you be open to a quick chat? "
+                        f"Thank you!\n\nBest regards,\n{sender_name}"
+                    )
+                    driver.execute_script(
+                        "arguments[0].innerHTML = ''; arguments[0].focus();"
+                        "document.execCommand('selectAll', false, null);"
+                        "document.execCommand('insertText', false, arguments[1]);",
+                        textarea, full_msg
+                    )
+                    time.sleep(1)
+                    sent = False
+                    for send_sel in ['button.msg-form__send-button', 'button[aria-label="Send"]']:
+                        send_btns = driver.find_elements(By.CSS_SELECTOR, send_sel)
+                        visible_send = [b for b in send_btns if b.is_displayed()]
+                        if visible_send:
+                            driver.execute_script("arguments[0].click();", visible_send[-1])
+                            time.sleep(2)
+                            sent = True
+                            break
+                    if not sent:
+                        try:
+                            textarea.send_keys(Keys.CONTROL + Keys.RETURN)
+                            time.sleep(2)
+                            sent = True
+                        except Exception:
+                            pass
 
                 if sent:
                     messaged.append(person_name)
-                    logger.info(f"LinkedIn Message: ✅ Sent to {person_name}")
                 else:
                     failed.append(person_name)
 
                 time.sleep(2)
 
             except Exception as e:
-                logger.warning(f"LinkedIn Message: error for {person_name}: {e}")
+                logger.warning(f"LinkedIn outreach error for {person_name}: {e}")
                 failed.append(person_name)
 
-        return {"messaged": messaged, "failed": failed, "total_found": len(msg_buttons)}
+        if not messaged and failed:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Found {len(action_buttons)} contact(s) but could not send. "
+                       "Try again or send manually from LinkedIn."
+            )
+        action = "connection request(s)" if use_connect else "message(s)"
+        return {"messaged": messaged, "failed": failed,
+                "total_found": len(action_buttons), "action": action}
 
     except HTTPException:
         raise
